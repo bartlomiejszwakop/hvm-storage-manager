@@ -14,6 +14,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 FSTAB = Path('/etc/fstab')
 DEV_ROOT = '/dev'  # podmieniane w testach
@@ -33,6 +34,9 @@ GIB = 1024 ** 3
 RESERVE_GIB = 1
 CONFIRM_PHRASE = 'TWORZ NOWY WOLUMEN'
 DEFAULT_MOUNT = '/vm-storage'
+# Krótka nazwa hosta (małe litery) → prefiks proponowanej nazwy datastore w Morpheus.
+# Pozostałe hosty: nazwa hosta WIELKIMI literami.
+HOST_ALIASES = {'hvm1': 'HVM1', 'node1': 'HVM1', 'hvm2': 'HVM2', 'node2': 'HVM2'}
 DRY_UUID = '<UUID-nowego-LV>'
 MORPHEUS_HINT = 'Dodaj w Morpheus: Infrastructure → Clusters → Storage → Datastores → ADD → Directory Pool.'
 HOSTS_NOTE = ('UWAGA: oba hosty HVM mogą mieć pule o tej samej nazwie, ale każdy ma INNY, lokalny dysk — '
@@ -1091,6 +1095,63 @@ def pools_command(mount=DEFAULT_MOUNT, refresh=False, assume_yes=False):
     return failed == 0
 
 
+def suggest_datastore_name(hostname, size_bytes=None):
+    """Np. HVM1-Local-1200 — unikalna per host, żeby nazwy z dwóch hostów się nie nakładały."""
+    short = (hostname or '').split('.')[0].strip().lower() or 'host'
+    prefix = HOST_ALIASES.get(short, short.upper())
+    return f'{prefix}-Local' + (f'-{round(size_bytes / GIB)}' if size_bytes else '')
+
+
+def mount_size_bytes(mount):
+    """Rozmiar urządzenia zamontowanego pod `mount` (lsblk -b) albo None."""
+    src = run(['findmnt', '-n', '-o', 'SOURCE', '-M', mount], check=False).stdout.strip()
+    if not src:
+        return None
+    p = run(['lsblk', '-b', '-d', '-n', '-o', 'SIZE', src], check=False)
+    value = p.stdout.strip().splitlines()[0].strip() if p.returncode == 0 and p.stdout.strip() else ''
+    return int(value) if value.isdigit() else None
+
+
+def audit_command(mount=DEFAULT_MOUNT):
+    """Audyt lokalnego datastore na tym hoście — wyłącznie odczyt, niczego nie zmienia."""
+    try:
+        mount = normalize_mount(mount)
+    except ValueError as exc:
+        err(str(exc)); return False
+    host = socket.gethostname()
+    print('\n=== AUDYT LOKALNEGO DATASTORE (tylko odczyt) ===')
+    print(f'Host: {host}')
+    for label, command in [('Punkt montowania', ['findmnt', '-M', mount]), ('Miejsce', ['df', '-hT', mount]),
+                           ('Wolumeny LVM', ['lvs', '-o', 'lv_name,vg_name,lv_size,lv_path']),
+                           ('Pule libvirt', ['virsh', 'pool-list', '--all'])]:
+        print(f'\n--- {label} ---'); output(command)
+    if not is_mounted(mount):
+        err(f'STOP: {mount} NIE jest osobnym punktem montowania — katalog leży na dysku systemowym.')
+        print(f'Proponowana nazwa (bez rozmiaru): {suggest_datastore_name(host)}')
+        return False
+    ok(f'\nProponowana nazwa lokalnego datastore w Morpheus: {suggest_datastore_name(host, mount_size_bytes(mount))}')
+    try:
+        pools = discover_pools(mount)
+    except RuntimeError as exc:
+        err(str(exc)); return False
+    short = host.split('.')[0].lower()
+    tags = {short, HOST_ALIASES.get(short, short).lower()}
+    print(f'\nPule libvirt typu dir wskazujące dokładnie {mount}:')
+    for pool in pools:
+        unique = any(t and t in pool['name'].lower() for t in tags)
+        print(f'  - {pool["name"]}' + ('' if unique else
+              '   ← nazwa nie zawiera nazwy hosta; na drugim hoście może być identyczna'))
+    if not pools:
+        print('  (brak) — pula wymaga osobnej konfiguracji (Directory Pool w Morpheus).')
+    print('\nUWAGA: nazwa puli libvirt na hoście i nazwa Datastore w Morpheus to dwie różne rzeczy.')
+    print('Samo virsh pool-define ani zmiana nazwy puli NIE tworzy datastore per host w Morpheus.')
+    print('Przed migracją sprawdź, czy Twoja wersja HPE Morpheus 9.x obsługuje datastore przypisany do węzła.')
+    print('Nie usuwaj obecnej puli ani jej plików — może być używana przez inne hosty/VM.')
+    print(HOSTS_NOTE)
+    print('Nie zmieniono żadnych zasobów.')
+    return True
+
+
 # --- tryb interaktywny ------------------------------------------------------------
 
 def ask(prompt, default=None, convert=str):
@@ -1192,7 +1253,8 @@ def interactive():
     print(f'HVM Storage Manager {__version__} — polski kreator LVM' + (' [DRY-RUN]' if DRY_RUN else ''))
     while True:
         print('\n1. Pokaż dyski i miejsce\n2. Utwórz / dokończ datastore LVM\n3. Pokaż pule libvirt\n'
-              '4. Sprawdź fstab i mounty\n5. Pokaż maszyny VM\n6. Wykryj i odśwież pule libvirt\n0. Wyjście')
+              '4. Sprawdź fstab i mounty\n5. Pokaż maszyny VM\n6. Wykryj i odśwież pule libvirt\n'
+              '7. Audyt lokalnego datastore na tym hoście\n0. Wyjście')
         try:
             choice = input('Wybór: ').strip()
         except EOFError:
@@ -1204,6 +1266,7 @@ def interactive():
             elif choice == '4': check_mounts()
             elif choice == '5': output(['virsh', 'list', '--all'])
             elif choice == '6': pools_command(ask('Punkt montowania', DEFAULT_MOUNT, normalize_mount), refresh=True)
+            elif choice == '7': audit_command(ask('Punkt montowania', DEFAULT_MOUNT, normalize_mount))
             elif choice == '0': return 0
             else: print('Nieznana opcja.')
         except Cancelled:
@@ -1220,7 +1283,7 @@ def build_parser():
     p.add_argument('--dry-run', action='store_true',
                    help='pokaż polecenia zmieniające system zamiast je wykonywać')
     p.add_argument('--log-file', default=LOG_FILE, metavar='PATH', help=f'plik logu (domyślnie {LOG_FILE})')
-    sub = p.add_subparsers(dest='command', metavar='{create,resume,pools}')
+    sub = p.add_subparsers(dest='command', metavar='{create,resume,pools,audit}')
     c = sub.add_parser('create', help='utwórz nowy wolumen bez menu (nieinteraktywnie)')
     c.add_argument('--vg', required=True, help='istniejąca grupa LVM, np. ubuntu-vg')
     c.add_argument('--name', required=True, help='nazwa nowego LV, np. vm-storage')
@@ -1240,7 +1303,9 @@ def build_parser():
     pl.add_argument('--mount', default=DEFAULT_MOUNT, help=f'punkt montowania (domyślnie {DEFAULT_MOUNT})')
     pl.add_argument('--refresh', action='store_true', help='odśwież znalezione pule (virsh pool-refresh)')
     pl.add_argument('--yes', action='store_true', help='nie pytaj o potwierdzenie odświeżenia')
-    for s in (c, r, pl):
+    a = sub.add_parser('audit', help='audyt lokalnego datastore na tym hoście i propozycja nazwy (tylko odczyt)')
+    a.add_argument('--mount', default=DEFAULT_MOUNT, help=f'punkt montowania (domyślnie {DEFAULT_MOUNT})')
+    for s in (c, r, pl, a):
         s.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return p
 
@@ -1271,6 +1336,8 @@ def main(argv=None):
                                       format_empty=args.format_empty) else 1
         if args.command == 'pools':
             return 0 if pools_command(args.mount, args.refresh, args.yes) else 1
+        if args.command == 'audit':
+            return 0 if audit_command(args.mount) else 1
         return interactive()
     except KeyboardInterrupt:
         print('\nPrzerwano.')

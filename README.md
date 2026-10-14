@@ -1,6 +1,6 @@
 # HVM Storage Manager
 
-Polski, prosty kreator konsolowy (v0.3.0) do tworzenia **nowych** wolumenów LVM/ext4 na Ubuntu HPE HVM: tworzy LV, formatuje go jako ext4, dopisuje wpis do `/etc/fstab` i montuje. Umie też bezpiecznie **dokończyć** niepełną konfigurację istniejącego LV i odświeżyć pule libvirt. Nie przebudowuje ani nie usuwa istniejących wolumenów.
+Polski, prosty kreator konsolowy (v0.4.0) do tworzenia **nowych** wolumenów LVM/ext4 na Ubuntu HPE HVM: tworzy LV, formatuje go jako ext4, dopisuje wpis do `/etc/fstab` i montuje. Umie też bezpiecznie **dokończyć** niepełną konfigurację istniejącego LV i odświeżyć pule libvirt, a audyt podpowiada unikalną nazwę datastore dla każdego hosta. Nie przebudowuje ani nie usuwa istniejących wolumenów.
 
 > Nie jest oficjalnym produktem HPE.
 
@@ -22,7 +22,7 @@ Instalator sprawdza Pythona 3.8+ i wymagane polecenia, pobiera program, weryfiku
 sudo hvm-storage-manager
 ```
 
-- Konkretna wersja (tag lub gałąź): `curl -fsSL https://raw.githubusercontent.com/bartlomiejszwakop/hvm-storage-manager/main/install.sh | sudo HVM_REF=v0.3.0 bash`
+- Konkretna wersja (tag lub gałąź): `curl -fsSL https://raw.githubusercontent.com/bartlomiejszwakop/hvm-storage-manager/main/install.sh | sudo HVM_REF=v0.4.0 bash`
 - Odinstalowanie: `curl -fsSL https://raw.githubusercontent.com/bartlomiejszwakop/hvm-storage-manager/main/install.sh | sudo HVM_UNINSTALL=1 bash`
 - Ostrożniej (najpierw przejrzyj skrypt): `curl -fsSLO https://raw.githubusercontent.com/bartlomiejszwakop/hvm-storage-manager/main/install.sh && less install.sh && sudo bash install.sh`
 
@@ -37,9 +37,9 @@ hvm-storage-manager --version          # obecna wersja
 curl -fsSL https://raw.githubusercontent.com/bartlomiejszwakop/hvm-storage-manager/main/install.sh | sudo bash
 ```
 
-Instalator wypisze zmianę wersji (np. `Zaktualizowano: 0.2.0 → 0.3.0`) i zachowa poprzednią wersję jako `/usr/local/sbin/hvm-storage-manager.prev`.
+Instalator wypisze zmianę wersji (np. `Zaktualizowano: 0.3.0 → 0.4.0`) i zachowa poprzednią wersję jako `/usr/local/sbin/hvm-storage-manager.prev`.
 
-- Aktualizacja do konkretnej wersji: `... | sudo HVM_REF=v0.3.0 bash` (lista wersji: zakładka *Tags* na GitHubie).
+- Aktualizacja do konkretnej wersji: `... | sudo HVM_REF=v0.4.0 bash` (lista wersji: zakładka *Tags* na GitHubie).
 - Powrót do poprzedniej wersji: `sudo mv /usr/local/sbin/hvm-storage-manager.prev /usr/local/sbin/hvm-storage-manager`.
 - Instalacja z `git clone`: `cd hvm-storage-manager && git pull`.
 - Aktualizuj każdy host HVM osobno i nie w trakcie działającej operacji (program trzyma blokadę `/run/hvm-storage-manager.lock`).
@@ -53,7 +53,7 @@ Menu interaktywne (po instalacji `sudo hvm-storage-manager`, z repozytorium):
 sudo python3 hvm_storage_manager.py
 ```
 
-Opcje menu: `1` dyski i miejsce, `2` utwórz / dokończ datastore LVM, `3` pule libvirt, `4` sprawdzenie fstab i mountów, `5` maszyny VM, `6` wykryj i odśwież pule libvirt, `0` wyjście. W kreatorze Enter przyjmuje wartość domyślną, `q` wraca do menu. Przed zmianami program pokazuje plan i wymaga wpisania frazy `TWORZ NOWY WOLUMEN`.
+Opcje menu: `1` dyski i miejsce, `2` utwórz / dokończ datastore LVM, `3` pule libvirt, `4` sprawdzenie fstab i mountów, `5` maszyny VM, `6` wykryj i odśwież pule libvirt, `7` audyt lokalnego datastore na tym hoście, `0` wyjście. W kreatorze Enter przyjmuje wartość domyślną, `q` wraca do menu. Przed zmianami program pokazuje plan i wymaga wpisania frazy `TWORZ NOWY WOLUMEN`.
 
 Podgląd bez zmian (polecenia zmieniające system są tylko wypisywane; nie wymaga root):
 
@@ -67,6 +67,7 @@ Tryb nieinteraktywny:
 sudo hvm-storage-manager create --vg ubuntu-vg --name vm-storage --size 1200 --mount /vm-storage [--yes] [--fix-dev-conflict]
 sudo hvm-storage-manager resume --vg ubuntu-vg --name vm-storage --mount /vm-storage [--yes] [--format-empty]
 sudo hvm-storage-manager pools [--mount /vm-storage] [--refresh] [--yes]
+sudo hvm-storage-manager audit [--mount /vm-storage]
 ```
 
 - `--size` — liczba całkowita GiB (1–1000000); w VG musi zostać co najmniej 1 GiB rezerwy.
@@ -118,6 +119,14 @@ Ponowne uruchomienie nic nie zmienia (`Nic do zrobienia`). Rollback w `resume` n
 ### Pule libvirt (`pools`, opcja 6)
 
 Sprawdza, że punkt jest osobnym systemem plików (a nie katalogiem na dysku systemowym), wyszukuje pule `dir` wskazujące dokładnie na ten katalog i pokazuje ich stan; odświeża je tylko po potwierdzeniu. Nie tworzy pul i nie korzysta z API Morpheus. Oba hosty mogą mieć pule o tej samej nazwie, ale na **innych lokalnych dyskach**.
+
+### Audyt i nazwy datastore (`audit`, opcja 7)
+
+Gdy dwa hosty mają lokalny datastore pod tą samą ścieżką i z tą samą nazwą, ich nazwy się nakładają. `audit` (tylko odczyt) pokazuje na danym hoście montowanie, miejsce, wolumeny LVM i pule libvirt, a następnie proponuje unikalną nazwę datastore: `<HOST>-Local-<rozmiar GiB>`, np. `HVM1-Local-1200` na `hvm1`/`node1` i `HVM2-Local-1200` na `hvm2`/`node2`. Inne hosty dostają swoją nazwę wielkimi literami (`HOST_ALIASES` w kodzie). Rozmiar jest odczytywany z urządzenia zamontowanego pod punktem.
+
+Pule, których nazwa nie zawiera nazwy hosta, są oznaczone, bo na drugim hoście mogą mieć identyczną nazwę. Uruchom `audit` na każdym hoście i porównaj wyniki.
+
+Ważne: nazwa puli libvirt i nazwa Datastore w Morpheus to dwie różne rzeczy — `virsh pool-define` ani zmiana nazwy puli nie tworzy datastore per host. Nie usuwaj obecnej puli klastrowej (może zawierać pliki VM). Przed migracją potwierdź w HPE, czy Twoja wersja Morpheus 9.x obsługuje datastore przypisany do konkretnego węzła.
 
 ## Dozwolone punkty montowania
 

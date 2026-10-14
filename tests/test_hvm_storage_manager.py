@@ -1510,7 +1510,7 @@ class MainTests(unittest.TestCase):
             m.main(['--version'])
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn(m.__version__, out.getvalue())
-        self.assertEqual(m.__version__, '0.3.0')
+        self.assertEqual(m.__version__, '0.4.0')
 
     def test_non_root_without_dry_run(self):
         with mock.patch.object(m, 'is_root', return_value=False), \
@@ -1628,6 +1628,70 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(fstab.read_bytes().startswith(raw))
             m.restore_fstab(backup, '')
         self.assertEqual(fstab.read_bytes(), raw)
+
+
+class AuditTests(unittest.TestCase):
+    setUp, fake, virsh_cmds = PoolsTests.setUp, PoolsTests.fake, PoolsTests.virsh_cmds
+
+    def fake_audit(self, mounted=True, src='/dev/mapper/ubuntu--vg-vm--storage', size=str(1200 * 1024 ** 3)):
+        base = self.fake(mounted=mounted)
+
+        def run(args, check=True, mutating=False):
+            args = [str(a) for a in args]
+            if args[:4] == ['findmnt', '-n', '-o', 'SOURCE']:
+                self.calls.append((args, mutating))
+                return cp(args, 0 if mounted else 1, src + '\n' if mounted else '')
+            if args[0] == 'lsblk':
+                self.calls.append((args, mutating))
+                return cp(args, 0, size + '\n')
+            return base(args, check, mutating)
+        return run
+
+    def audit(self, host='hvm1', **kw):
+        out = io.StringIO()
+        with mock.patch.object(m, 'run', self.fake_audit(**kw)), \
+                mock.patch.object(m.socket, 'gethostname', return_value=host), \
+                contextlib.redirect_stdout(out):
+            result = m.audit_command(self.mount)
+        return result, out.getvalue()
+
+    def test_suggest_name(self):
+        g = m.GIB
+        self.assertEqual(m.suggest_datastore_name('hvm1', 1200 * g), 'HVM1-Local-1200')
+        self.assertEqual(m.suggest_datastore_name('NODE2.lab.local', 1200 * g), 'HVM2-Local-1200')
+        self.assertEqual(m.suggest_datastore_name('srv-a', 500 * g), 'SRV-A-Local-500')
+        self.assertEqual(m.suggest_datastore_name('hvm2'), 'HVM2-Local')
+        self.assertEqual(m.suggest_datastore_name(''), 'HOST-Local')
+
+    def test_audit_is_read_only(self):
+        result, out = self.audit()
+        self.assertTrue(result)
+        self.assertIn('HVM1-Local-1200', out)
+        self.assertIn('Nie zmieniono żadnych zasobów', out)
+        self.assertFalse(any(mut for _, mut in self.calls))
+        self.assertNotIn('pool-refresh', self.virsh_cmds())
+
+    def test_audit_warns_on_pool_name_without_host(self):
+        self.pools['hvm1-local'] = POOL_XML.format(t='dir', n='hvm1-local', p=self.mount)
+        _, out = self.audit()
+        lines = [line for line in out.splitlines() if line.strip().startswith('- ')]
+        self.assertTrue(any('vm-pool' in line and 'może być identyczna' in line for line in lines))
+        self.assertTrue(any('hvm1-local' in line and 'może być identyczna' not in line for line in lines))
+
+    def test_audit_stops_when_not_mountpoint(self):
+        result, out = self.audit(mounted=False)
+        self.assertFalse(result)
+        self.assertIn('STOP', out)
+        self.assertIn('HVM1-Local', out)
+        self.assertNotIn('pool-dumpxml', self.virsh_cmds())
+
+    def test_cli_audit_dispatch(self):
+        with mock.patch.object(m, 'is_root', return_value=True), \
+                mock.patch.object(m, 'acquire_lock', return_value=True), \
+                mock.patch.object(m, 'setup_logging'), \
+                mock.patch.object(m, 'audit_command', return_value=True) as audit:
+            self.assertEqual(m.main(['audit', '--mount', '/vm-storage']), 0)
+        audit.assert_called_once_with('/vm-storage')
 
 
 if __name__ == '__main__':
