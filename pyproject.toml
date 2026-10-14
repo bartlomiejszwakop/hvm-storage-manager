@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hvm-storage-manager"
+version = "1.0.0"
+description = "Lokalne magazyny VM (LVM + ext4 + pula libvirt) dla HPE Morpheus VM Essentials (HVM) na Ubuntu"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+]
+
+[project.scripts]
+hvm-storage-manager = "hvm.cli:main"
+
+[tool.setuptools]
+packages = ["hvm"]

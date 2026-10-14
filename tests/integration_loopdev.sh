@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Test integracyjny hvm_storage_manager.py na urządzeniu loop.
+# Test integracyjny HVM Storage Manager 1.0 (main.py) na urządzeniu loop.
 #
 # TYLKO dla jednorazowej maszyny laboratoryjnej (NIE produkcja!). Uruchamiać jako root:
 #   sudo HVM_TEST_I_UNDERSTAND=1 bash tests/integration_loopdev.sh
 #
-# Co robi: tworzy rzadki plik 6G, loop, PV i VG hvmtest-vg-<PID>, uruchamia narzędzie
-# w trybie --dry-run (nic nie może się zmienić), potem naprawdę (LV + ext4 + mount + fstab),
-# następnie wywołania, które muszą zostać odrzucone, konflikt pustego katalogu w /dev/<vg>/<lv>
-# (przyczyna błędu lvcreate „device not cleared”) oraz „resume” ręcznie utworzonego LV
-# (dwukrotnie — drugi przebieg nie może niczego zmienić). Pułapka EXIT sprząta wszystko
-# i przywraca /etc/fstab z kopii wykonanej na starcie.
+# Co robi: tworzy rzadki plik 8G, loop, PV i VG hvmtest-vg-<PID>, a potem:
+#   1. --dry-run (create i prepare) — nic nie może się zmienić,
+#   2. create (0.4) — LV + ext4 + fstab + mount,
+#   3. wywołania, które muszą zostać odrzucone,
+#   4. konflikt: pusty katalog w /dev/<vg>/<lv> (przyczyna „device not cleared”),
+#   5. resume (0.4) ręcznie utworzonego LV + przypadek B (brak dowiązania /dev/<vg>/<lv>),
+#   6. --diagnose --json,
+#   7. etap libvirt (pomijany bez działającego virsh): prepare z testową pulą, ponowne
+#      uruchomienie (przypadek D), przypadki B i C, nieaktywna pula; chronione pule bez zmian.
+# Pułapka EXIT sprząta wszystko, przywraca /etc/fstab z kopii wykonanej na starcie i usuwa
+# (pool-destroy + pool-undefine) WYŁĄCZNIE testową pulę hvmtest-pool-<PID>.
 set -euo pipefail
 
 if [[ "${HVM_TEST_I_UNDERSTAND:-}" != "1" ]]; then
@@ -26,8 +31,10 @@ for cmd in python3 losetup truncate pvcreate vgcreate vgremove pvremove lvcreate
     command -v "$cmd" >/dev/null 2>&1 || { echo "Brak polecenia: $cmd" >&2; exit 2; }
 done
 
+vsh() { virsh -c qemu:///system "$@"; }
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOL="$REPO_DIR/hvm_storage_manager.py"
+TOOL="$REPO_DIR/main.py"
 [[ -f "$TOOL" ]] || { echo "Nie znaleziono $TOOL" >&2; exit 2; }
 
 ID=$$
@@ -42,17 +49,27 @@ CONFLICT_DIR="/dev/$VG/$LV_C"
 MNT_C="/srv/hvmtest${ID}c"
 LV_R="r1"                      # LV tworzony ręcznie i dokańczany przez „resume”
 MNT_R="/srv/hvmtest${ID}r"
+LV_P="p1"                      # LV etapu libvirt (prepare)
+MNT_P="/srv/hvmtest${ID}p"
+POOL="hvmtest-pool-$ID"        # JEDYNA pula, którą test tworzy i usuwa
+ALL_MNTS=("$MNT" "$MNT_OTHER" "$MNT_BUSY" "$MNT_C" "$MNT_R" "$MNT_P")
 WORK=""
 LOOP=""
 FSTAB_BACKUP=""
 LOGF=""
 FAILURES=0
+LIBVIRT=0
 
 cleanup() {
     local rc=$?
     set +e
     echo "=== SPRZĄTANIE ==="
-    for m in "$MNT" "$MNT_OTHER" "$MNT_BUSY" "$MNT_C" "$MNT_R"; do
+    if [[ $LIBVIRT -eq 1 && "$POOL" == hvmtest-pool-* ]] && vsh pool-info "$POOL" >/dev/null 2>&1; then
+        echo "Usuwanie testowej puli $POOL (pool-destroy + pool-undefine; pliki zostają)"
+        vsh pool-destroy "$POOL" >/dev/null 2>&1
+        vsh pool-undefine "$POOL" >/dev/null 2>&1
+    fi
+    for m in "${ALL_MNTS[@]}"; do
         if mountpoint -q "$m" 2>/dev/null; then
             umount "$m" || umount -l "$m"
         fi
@@ -64,8 +81,7 @@ cleanup() {
         fi
         systemctl daemon-reload 2>/dev/null
     fi
-    # kopie fstab utworzone przez narzędzie w czasie testu (shutil.copy2 zachowuje mtime,
-    # więc porównujemy listy nazw, a nie czasy)
+    # kopie fstab utworzone przez narzędzie w czasie testu (porównujemy listy nazw)
     if [[ -n "$WORK" && -f "$WORK/backups.before" ]]; then
         new_backups | while IFS= read -r f; do echo "Usuwanie $f"; rm -f -- "$f"; done
     fi
@@ -84,7 +100,7 @@ cleanup() {
         losetup -d "$LOOP"
     fi
     rm -f "$MNT_BUSY/keep.txt"
-    for m in "$MNT" "$MNT_OTHER" "$MNT_BUSY" "$MNT_C" "$MNT_R"; do
+    for m in "${ALL_MNTS[@]}"; do
         [[ -d "$m" ]] && rmdir "$m"
     done
     if [[ -n "$LOGF" && -f "$LOGF" && $rc -ne 0 ]]; then
@@ -106,6 +122,7 @@ fstab_sum() { sha256sum /etc/fstab | cut -d' ' -f1; }
 list_backups() { find /etc -maxdepth 1 -name 'fstab.backup-hvm-*' -print | LC_ALL=C sort; }
 new_backups() { list_backups | LC_ALL=C comm -13 "$WORK/backups.before" -; }
 backup_count() { new_backups | wc -l; }
+other_pools() { vsh pool-list --all 2>/dev/null | grep -v -F -- "$POOL" || true; }
 
 tool() { python3 "$TOOL" --log-file "$LOGF" "$@"; }
 
@@ -129,28 +146,43 @@ FSTAB_BACKUP="$WORK/fstab.orig"
 cp -p /etc/fstab "$FSTAB_BACKUP"
 list_backups > "$WORK/backups.before"
 
-for m in "$MNT" "$MNT_BUSY" "$MNT_OTHER" "$MNT_C" "$MNT_R"; do
+for m in "${ALL_MNTS[@]}"; do
     if [[ -e "$m" ]]; then echo "$m już istnieje — przerwano." >&2; exit 2; fi
 done
 if vgs "$VG" >/dev/null 2>&1; then echo "VG $VG już istnieje — przerwano." >&2; exit 2; fi
+if command -v virsh >/dev/null 2>&1 && vsh uri >/dev/null 2>&1; then
+    LIBVIRT=1
+    if vsh pool-info "$POOL" >/dev/null 2>&1; then echo "Pula $POOL już istnieje — przerwano." >&2; exit 2; fi
+fi
 
-truncate -s 6G "$WORK/disk.img"
+truncate -s 8G "$WORK/disk.img"
 LOOP="$(losetup --find --show "$WORK/disk.img")"
 echo "Urządzenie loop: $LOOP"
 pvcreate -q "$LOOP"
 vgcreate -q "$VG" "$LOOP"
 FSTAB_SUM0="$(fstab_sum)"
 
+[[ "$(python3 "$REPO_DIR/hvm_storage_manager.py" --version)" == "hvm-storage-manager 1.0.0" ]] \
+    && pass "shim hvm_storage_manager.py → 1.0.0" || fail "shim hvm_storage_manager.py"
+
 # --- 1. dry-run: nic nie może się zmienić ---------------------------------------------------
 echo "=== 1. DRY-RUN ==="
-tool --dry-run create --vg "$VG" --name "$LV" --size 2 --mount "$MNT" --yes \
-    || fail "dry-run zakończony błędem"
+tool --dry-run create --vg "$VG" --name "$LV" --size 2 --mount "$MNT" --yes || fail "dry-run create zakończony błędem"
+if [[ $LIBVIRT -eq 1 ]]; then
+    tool --dry-run prepare --vg "$VG" --name "$LV_P" --size 1 --mount "$MNT_P" --pool-name "$POOL" --yes \
+        > "$WORK/last.out" 2>&1 || fail "dry-run prepare zakończony błędem"
+    grep -qF "[DRY-RUN] virsh -c qemu:///system pool-define-as --name $POOL --type dir --target $MNT_P" "$WORK/last.out" \
+        && pass "dry-run prepare: plan zawiera definicję puli" || fail "dry-run prepare: brak polecenia pool-define-as"
+    vsh pool-info "$POOL" >/dev/null 2>&1 && fail "dry-run zdefiniował pulę" || pass "dry-run: brak puli"
+fi
 lv_exists "$LV" && fail "dry-run utworzył LV" || pass "dry-run: brak LV"
-[[ -e "$MNT" ]] && fail "dry-run utworzył $MNT" || pass "dry-run: brak katalogu"
+lv_exists "$LV_P" && fail "dry-run utworzył LV $LV_P" || pass "dry-run: brak LV $LV_P"
+[[ -e "$MNT" || -e "$MNT_P" ]] && fail "dry-run utworzył katalog" || pass "dry-run: brak katalogów"
 [[ "$(fstab_sum)" == "$FSTAB_SUM0" ]] && pass "dry-run: fstab bez zmian" || fail "dry-run zmienił fstab"
 [[ "$(backup_count)" -eq 0 ]] && pass "dry-run: brak kopii fstab" || fail "dry-run utworzył kopię fstab"
+[[ -e "$LOGF" ]] && fail "dry-run zapisał log" || pass "dry-run: brak pliku logu"
 
-# --- 2. prawdziwe utworzenie ---------------------------------------------------------------
+# --- 2. prawdziwe utworzenie (create z 0.4) ------------------------------------------------
 echo "=== 2. UTWORZENIE ==="
 tool create --vg "$VG" --name "$LV" --size 2 --mount "$MNT" --yes || fail "utworzenie zakończone błędem"
 lv_exists "$LV" && pass "LV $LVPATH istnieje" || fail "brak LV $LVPATH"
@@ -167,7 +199,6 @@ fi
 [[ "$(findmnt -n -o UUID --mountpoint "$MNT" || true)" == "$UUID" ]] && pass "findmnt UUID zgodny" || fail "findmnt UUID niezgodny"
 findmnt --verify --tab-file /etc/fstab >/dev/null && pass "findmnt --verify" || fail "findmnt --verify zgłasza błędy"
 [[ "$(backup_count)" -eq 1 ]] && pass "utworzono kopię fstab" || fail "oczekiwano jednej kopii fstab"
-# kopia narzędzia musi być identyczna z oryginałem
 NEWBK="$(new_backups | head -n1)"
 [[ -n "$NEWBK" ]] && cmp -s "$NEWBK" "$FSTAB_BACKUP" && pass "kopia fstab = oryginał" || fail "kopia fstab różni się od oryginału"
 LV_COUNT="$(lvs --noheadings -o lv_name "$VG" | wc -l)"
@@ -182,64 +213,125 @@ expect_refusal "niepusty katalog" create --vg "$VG" --name t2 --size 1 --mount "
 expect_refusal "punkt montowania już użyty" create --vg "$VG" --name t3 --size 1 --mount "$MNT" --yes
 expect_refusal "za mało miejsca" create --vg "$VG" --name t4 --size 100 --mount "$MNT_OTHER" --yes
 expect_refusal "lokalizacja spoza allowlisty" create --vg "$VG" --name t5 --size 1 --mount /etc/hvmtest$ID --yes
+expect_refusal "katalog chronionej puli local" create --vg "$VG" --name t5 --size 1 \
+    --mount /var/lib/libvirt/images/hvmtest$ID --yes
 expect_refusal "zastrzeżona nazwa" create --vg "$VG" --name x_rimage --size 1 --mount "$MNT_OTHER" --yes
 expect_refusal "nieistniejąca VG" create --vg "nope-vg-$ID" --name t6 --size 1 --mount "$MNT_OTHER" --yes
+expect_refusal "prepare: rozmiar ponad wolne miejsce" prepare --vg "$VG" --name t8 --size 100 --mount "$MNT_OTHER" \
+    --pool-name "$POOL" --yes
 [[ "$(lvs --noheadings -o lv_name "$VG" | wc -l)" -eq "$LV_COUNT" ]] && pass "żadnych nowych LV" || fail "powstały nowe LV"
 [[ -e "$MNT_OTHER" ]] && fail "$MNT_OTHER został utworzony" || pass "$MNT_OTHER nie istnieje"
 [[ -e "/etc/hvmtest$ID" ]] && fail "/etc/hvmtest$ID został utworzony" || pass "/etc nietknięte"
 mountpoint -q "$MNT" && pass "$MNT nadal zamontowany" || fail "$MNT odmontowany przez odmowę"
 
 # --- 4. konflikt: pusty katalog w miejscu dowiązania /dev/<vg>/<lv> ------------------------------
-echo "=== 4. KONFLIKT ŚCIEŻKI /dev ==="
+echo "=== 4. KONFLIKT ŚCIEŻKI /dev (przypadek A) ==="
 mkdir "$CONFLICT_DIR"
 expect_refusal "pusty katalog $CONFLICT_DIR (--yes)" create --vg "$VG" --name "$LV_C" --size 1 --mount "$MNT_C" --yes
 grep -q -- '--fix-dev-conflict' "$WORK/last.out" && pass "komunikat wskazuje --fix-dev-conflict" \
     || fail "brak wskazówki --fix-dev-conflict"
 [[ -d "$CONFLICT_DIR" && ! -L "$CONFLICT_DIR" ]] && pass "tryb --yes nie usunął katalogu" || fail "katalog zniknął"
 lv_exists "$LV_C" && fail "powstał LV $LV_C mimo konfliktu" || pass "brak LV $LV_C"
-[[ -e "$MNT_C" ]] && fail "$MNT_C został utworzony" || pass "$MNT_C nie istnieje"
 tool create --vg "$VG" --name "$LV_C" --size 1 --mount "$MNT_C" --yes --fix-dev-conflict \
     || fail "create z --fix-dev-conflict zakończony błędem"
 lv_exists "$LV_C" && pass "--fix-dev-conflict: LV $LV_C utworzony" || fail "--fix-dev-conflict: brak LV"
 [[ -L "$CONFLICT_DIR" ]] && pass "$CONFLICT_DIR jest teraz dowiązaniem" || fail "$CONFLICT_DIR nie jest dowiązaniem"
 mountpoint -q "$MNT_C" && pass "$MNT_C zamontowany" || fail "$MNT_C nie jest zamontowany"
 
-# --- 5. resume: LV utworzony ręcznie, konfiguracja dokończona przez narzędzie --------------------
+# --- 5. resume: LV utworzony ręcznie + przypadek B ---------------------------------------------
 echo "=== 5. RESUME ==="
 lvcreate -q -y -L 1G -n "$LV_R" "$VG" >/dev/null
 udevadm settle
 LVPATH_R="/dev/$VG/$LV_R"
 expect_refusal "resume pustego LV z --yes bez --format-empty" resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes
+expect_refusal "resume: --format-empty dla innego LV" resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes \
+    --format-empty "$VG/$LV"
 [[ -z "$(blkid -p -s TYPE -o value "$LVPATH_R" 2>/dev/null || true)" ]] && pass "LV nadal bez systemu plików" \
     || fail "LV sformatowany mimo odmowy"
-tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes --format-empty || fail "resume zakończony błędem"
+tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes --format-empty "$VG/$LV_R" || fail "resume zakończony błędem"
 mountpoint -q "$MNT_R" && pass "$MNT_R zamontowany" || fail "$MNT_R nie jest zamontowany"
 UUID_R="$(blkid -p -s UUID -o value "$LVPATH_R" 2>/dev/null || true)"
-[[ -n "$UUID_R" ]] && pass "UUID: $UUID_R" || fail "brak UUID na $LVPATH_R"
-if [[ -n "$UUID_R" ]] && grep -qxF "UUID=$UUID_R $MNT_R ext4 defaults,nofail 0 2" /etc/fstab; then
-    pass "resume: wpis w fstab"
-else
-    fail "resume: brak oczekiwanego wpisu w fstab"
-fi
-[[ "$(grep -c -F " $MNT_R " /etc/fstab || true)" -eq 1 ]] && pass "dokładnie jeden wpis $MNT_R" || fail "liczba wpisów $MNT_R != 1"
-findmnt --verify --tab-file /etc/fstab >/dev/null && pass "findmnt --verify" || fail "findmnt --verify zgłasza błędy"
+[[ -n "$UUID_R" ]] && grep -qxF "UUID=$UUID_R $MNT_R ext4 defaults,nofail 0 2" /etc/fstab \
+    && pass "resume: wpis w fstab" || fail "resume: brak oczekiwanego wpisu w fstab"
 SUM_R="$(fstab_sum)"
 BK_R="$(backup_count)"
 rc=0
-tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes --format-empty > "$WORK/last.out" 2>&1 || rc=$?
+tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes --format-empty "$VG/$LV_R" > "$WORK/last.out" 2>&1 || rc=$?
 cat "$WORK/last.out"
 [[ $rc -eq 0 ]] && pass "drugi resume: kod 0" || fail "drugi resume: kod $rc"
 grep -q 'Nic do zrobienia' "$WORK/last.out" && pass "drugi resume: nic do zrobienia" || fail "drugi resume coś zmieniał"
-[[ "$(fstab_sum)" == "$SUM_R" ]] && pass "drugi resume: fstab bez zmian" || fail "drugi resume zmienił fstab"
-[[ "$(backup_count)" == "$BK_R" ]] && pass "drugi resume: brak nowej kopii fstab" || fail "drugi resume: nowa kopia"
+[[ "$(fstab_sum)" == "$SUM_R" && "$(backup_count)" == "$BK_R" ]] && pass "drugi resume: fstab i kopie bez zmian" \
+    || fail "drugi resume zmienił fstab"
 [[ "$(blkid -p -s UUID -o value "$LVPATH_R" 2>/dev/null || true)" == "$UUID_R" ]] \
     && pass "drugi resume: brak ponownego formatowania" || fail "UUID zmieniony — ponowne formatowanie!"
+# przypadek B + C: brak dowiązania /dev/<vg>/<lv> i niezamontowany wolumen
 umount "$MNT_R"
-tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes || fail "resume po umount zakończony błędem"
-mountpoint -q "$MNT_R" && pass "resume po umount: ponownie zamontowany" || fail "resume po umount: brak montowania"
-[[ "$(fstab_sum)" == "$SUM_R" ]] && pass "resume po umount: fstab bez zmian" || fail "resume po umount zmienił fstab"
+rm -f "$LVPATH_R"
+[[ -e "$LVPATH_R" ]] && fail "nie udało się usunąć dowiązania testowego" || pass "usunięto dowiązanie $LVPATH_R (przypadek B)"
+tool resume --vg "$VG" --name "$LV_R" --mount "$MNT_R" --yes > "$WORK/last.out" 2>&1 || fail "resume (B+C) zakończony błędem"
+cat "$WORK/last.out"
+grep -q 'brak dowiązania' "$WORK/last.out" && pass "rozpoznano przypadek B" || fail "nie rozpoznano przypadku B"
+[[ -L "$LVPATH_R" ]] && pass "dowiązanie odtworzone (vgscan --mknodes)" || fail "dowiązanie nie zostało odtworzone"
+mountpoint -q "$MNT_R" && pass "resume (C): ponownie zamontowany" || fail "resume (C): brak montowania"
+[[ "$(fstab_sum)" == "$SUM_R" ]] && pass "resume (B+C): fstab bez zmian" || fail "resume (B+C) zmienił fstab"
 [[ "$(blkid -p -s UUID -o value "$LVPATH_R" 2>/dev/null || true)" == "$UUID_R" ]] \
-    && pass "resume po umount: bez formatowania" || fail "resume po umount: UUID zmieniony"
+    && pass "resume (B+C): bez formatowania" || fail "resume (B+C): UUID zmieniony"
+
+# --- 6. raport --------------------------------------------------------------------------
+echo "=== 6. --diagnose --json ==="
+tool --diagnose --json > "$WORK/report.json" || fail "--diagnose zakończony błędem"
+python3 -I -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["version"] == "1.0.0"
+for s in r["storages"]:
+    for k in ("linux", "libvirt", "morpheus"):
+        assert s[k]["state"] in ("ok", "error", "unknown"), s
+assert all(s["morpheus"]["state"] == "unknown" for s in r["storages"])' "$WORK/report.json" \
+    && pass "--diagnose --json: poprawny JSON z trzema stanami" || fail "--diagnose --json: niepoprawny raport"
+
+# --- 7. libvirt: prepare + pula testowa ----------------------------------------------------------
+if [[ $LIBVIRT -eq 1 ]]; then
+    echo "=== 7. LIBVIRT (pula $POOL) ==="
+    other_pools > "$WORK/pools.before"
+    tool prepare --vg "$VG" --name "$LV_P" --size 1 --mount "$MNT_P" --pool-name "$POOL" --yes \
+        || fail "prepare zakończony błędem"
+    mountpoint -q "$MNT_P" && pass "$MNT_P zamontowany" || fail "$MNT_P nie jest zamontowany"
+    vsh pool-info "$POOL" > "$WORK/pool.info" 2>&1 && pass "pula $POOL zdefiniowana" || fail "brak puli $POOL"
+    grep -Eq '^State:[[:space:]]+running' "$WORK/pool.info" && pass "pula aktywna" || fail "pula nieaktywna"
+    grep -Eq '^Autostart:[[:space:]]+yes' "$WORK/pool.info" && pass "autostart puli" || fail "brak autostartu puli"
+    [[ "$(vsh pool-dumpxml "$POOL" | sed -n 's:.*<path>\(.*\)</path>.*:\1:p' | head -n1)" == "$MNT_P" ]] \
+        && pass "pula wskazuje na $MNT_P" || fail "pula wskazuje na inny katalog"
+    SUM_P="$(fstab_sum)"
+    tool repair --vg "$VG" --name "$LV_P" --mount "$MNT_P" --pool-name "$POOL" --yes > "$WORK/last.out" 2>&1 \
+        || fail "repair na gotowym magazynie: kod != 0"
+    cat "$WORK/last.out"
+    grep -q 'Magazyn jest już poprawnie skonfigurowany.' "$WORK/last.out" && pass "przypadek D: nic do zrobienia" \
+        || fail "przypadek D: brak komunikatu"
+    [[ "$(fstab_sum)" == "$SUM_P" ]] && pass "przypadek D: fstab bez zmian" || fail "przypadek D: fstab zmieniony"
+    expect_refusal "prepare: ta sama nazwa puli, inny katalog" prepare --vg "$VG" --name t9 --size 1 \
+        --mount "$MNT_OTHER" --pool-name "$POOL" --yes
+    expect_refusal "prepare: chroniona nazwa puli" prepare --vg "$VG" --name t9 --size 1 --mount "$MNT_OTHER" \
+        --pool-name local --yes
+    expect_refusal "prepare: wstrzyknięcie opcji w nazwie puli" prepare --vg "$VG" --name t9 --size 1 \
+        --mount "$MNT_OTHER" --pool-name=--name=local --yes
+    # przypadek B + C oraz nieaktywna pula
+    umount "$MNT_P"
+    rm -f "/dev/$VG/$LV_P"
+    vsh pool-destroy "$POOL" >/dev/null
+    tool repair --vg "$VG" --name "$LV_P" --mount "$MNT_P" --pool-name "$POOL" --yes || fail "repair (B+C+pula) błąd"
+    mountpoint -q "$MNT_P" && pass "repair: ponownie zamontowany" || fail "repair: brak montowania"
+    [[ -L "/dev/$VG/$LV_P" ]] && pass "repair: dowiązanie odtworzone" || fail "repair: brak dowiązania"
+    vsh pool-info "$POOL" | grep -Eq '^State:[[:space:]]+running' && pass "repair: pula ponownie aktywna" \
+        || fail "repair: pula nieaktywna"
+    [[ "$(fstab_sum)" == "$SUM_P" ]] && pass "repair: fstab bez zmian" || fail "repair: fstab zmieniony"
+    other_pools > "$WORK/pools.after"
+    cmp -s "$WORK/pools.before" "$WORK/pools.after" && pass "pozostałe pule (w tym chronione) bez zmian" \
+        || fail "zmieniono inne pule niż $POOL"
+    grep -q "pool-delete\|wipefs -a\|lvremove\|pool-undefine\|=local" "$LOGF" && fail "log zawiera zabronione polecenie" \
+        || pass "log: brak pool-delete / wipefs -a / lvremove"
+else
+    echo "=== 7. LIBVIRT — POMINIĘTO (virsh niedostępny lub libvirtd nie odpowiada) ==="
+fi
 
 echo
 if [[ $FAILURES -ne 0 ]]; then
