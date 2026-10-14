@@ -14,7 +14,7 @@ die() { echo "BŁĄD: $*" >&2; exit 1; }
 [[ "$(id -u)" -eq 0 ]] || die "uruchom jako root (… | sudo bash)."
 
 if [[ "${HVM_UNINSTALL:-}" == "1" ]]; then
-    rm -f "$TARGET"
+    rm -f "$TARGET" "${TARGET}.prev"
     echo "Usunięto $TARGET. Log /var/log/hvm-storage-manager.log i kopie fstab pozostawiono."
     exit 0
 fi
@@ -39,6 +39,16 @@ head -n 1 "$tmp" | grep -q '^#!/usr/bin/env python3' || die "pobrany plik nie wy
 python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" \
     || die "pobrany plik zawiera błędy składni."
 
+old=""
+[[ -x "$TARGET" ]] && old="$("$TARGET" --version 2>/dev/null | awk '{print $NF}')" || true
+if [[ -f "$TARGET" ]]; then
+    cp -p "$TARGET" "${TARGET}.prev"  # poprzednia wersja na wypadek potrzeby powrotu
+fi
 install -m 0755 -o root -g root "$tmp" "$TARGET"
-echo "Zainstalowano: $("$TARGET" --version) → $TARGET"
+new="$("$TARGET" --version | awk '{print $NF}')"
+if [[ -n "$old" ]]; then
+    echo "Zaktualizowano: ${old} → ${new} ($TARGET, poprzednia wersja: ${TARGET}.prev)"
+else
+    echo "Zainstalowano: ${new} → $TARGET"
+fi
 echo "Uruchom: sudo hvm-storage-manager   (podgląd bez zmian: sudo hvm-storage-manager --dry-run)"
